@@ -32,31 +32,83 @@ logger = logging.getLogger(__name__)
 #
 ####################
 
-
 class RestrictiveFilterError(Exception):
     pass
-
 
 class InvalidVoteError(Exception):
     pass
 
-
 class VoteMapNoInitialised(Exception):
     pass
 
+# 1) Kısa isim sözlüğü (örnek)
+SHORT_NAME_MAP = {
+    "Utah Beach": "Utah B.",
+    "Carentan": "Carent.",
+    "Hill 400": "Hill400",
+    # İhtiyacınız oldukça ekleyebilirsiniz...
+}
+
+def localize_map_name(map_obj: maps.Layer) -> str:
+    """
+    Bu fonksiyon harita adını kısaltır ve
+    Night/Dusk/Rain gibi kelimeleri Türkçeleştirir.
+    """
+    name = map_obj.pretty_name
+
+    # Parantezli ve benzeri varyantları Türkçe yapalım:
+    # "(Night)" -> "(Gece)", "(Rain)" -> "(Yağmurlu)", "(Dusk)" -> "(Alacakaranlık)"
+    translations = {
+        "(Night)": "(Gece)",
+        "(Rain)": "(Yağmurlu)",
+        "(Dusk)": "(Alacakaranlık)",
+        "night": "(Gece)",          # Harita adında sadece 'night' geçiyorsa
+        "rain": "(Yağmurlu)",
+        "dusk": "(Alacakaranlık)",
+    }
+    # Küçük büyük harf uyumsuzluğu durumlarına dikkat etmeniz gerekebilir
+    # isterseniz bunları .lower() gibi bir yaklaşımla da elden geçirebilirsiniz.
+    for eng, tr in translations.items():
+        name = name.replace(eng, tr)
+
+    # Kısa isim sözlüğü
+    # "Carentan (Gece)" -> "Carent. (Gece)" vb.
+    for long_name, short_name in SHORT_NAME_MAP.items():
+        if long_name in name:
+            name = name.replace(long_name, short_name)
+
+    return name
 
 def _get_random_map_selection(
-    maps: list[maps.Layer], nb_to_return: int, history=None
+    maps_list: list[maps.Layer], nb_to_return: int, history=None
 ) -> list[maps.Layer]:
-    # if history:
-    # Calculate weights to stir selection towards least played maps
+    """
+    Harita listesinden nb_to_return kadar rastgele seçim yaparken,
+    night haritalarına 1, diğerlerine 3 kez ağırlık vererek
+    night haritalarının daha az seçilmesini sağlar.
+    """
     try:
-        if nb_to_return > 0 and len(maps) < nb_to_return:
-            nb_to_return = len(maps)
-        return random.sample(maps, k=nb_to_return)
+        if nb_to_return > 0 and len(maps_list) < nb_to_return:
+            nb_to_return = len(maps_list)
+
+        # Weighted list oluştur
+        weighted_list = []
+        for m in maps_list:
+            # Burada night kelimesini .lower() ile kontrol ediyoruz:
+            lower_name = m.pretty_name.lower()
+            if "night" in lower_name:
+                # Night haritaları listeye 1 kez
+                weighted_list.append(m)
+            else:
+                # Normal haritalar 3 kez
+                weighted_list.extend([m, m, m])
+
+        if nb_to_return > len(weighted_list):
+            nb_to_return = len(weighted_list)
+
+        return random.sample(weighted_list, nb_to_return)
     except (IndexError, ValueError):
         return []
-
 
 def suggest_next_maps(
     maps_history: MapsHistory,
@@ -108,7 +160,6 @@ def suggest_next_maps(
             allow_consecutive_skirmishes=allow_consecutive_skirmishes,
         )
 
-
 def _suggest_next_maps(
     maps_history: list[maps.Layer],
     current_map: maps.Layer,
@@ -154,7 +205,6 @@ def _suggest_next_maps(
         )
 
     if not allow_consecutive_offensives_of_opposite_side and current_side:
-        # TODO: make sure this is correct
         remaining_maps = [
             maps.parse_layer(m)
             for m in remaining_maps
@@ -212,8 +262,6 @@ def _suggest_next_maps(
     logger.info("Suggestion %s", [m.pretty_name for m in selection])
     return selection
 
-
-# TODO:  Handle empty selection (None)
 class VoteMap:
     def __init__(self) -> None:
         self.rcon = get_rcon()
@@ -222,7 +270,6 @@ class VoteMap:
         self.optin_name = "votemap_reminder"
         self.whitelist_key = "votemap_whitelist"
 
-    # TODO: fix votes typing
     @staticmethod
     def join_vote_options(
         selection: list[maps.Layer],
@@ -231,8 +278,11 @@ class VoteMap:
         total_votes: int,
         join_char: str = " ",
     ) -> str:
+        """
+        Burada doğrudan m.pretty_name yerine localize_map_name(m) kullanıyoruz
+        """
         return join_char.join(
-            f"[{maps_to_numbers[m]}] {m.pretty_name} - {ranked_votes[m]}/{total_votes} votes"
+            f"[{maps_to_numbers[m]}] {localize_map_name(m)} - {ranked_votes[m]}/{total_votes} oy"
             for m in selection
         )
 
@@ -249,38 +299,23 @@ class VoteMap:
         total_votes = len(votes)
         ranked_votes = Counter(votes.values())
 
-        # 0: map 1, 1: map 2, etc.
+        # Örnek: 0: map_1, 1: map_2...
         vote_dict = numbered_maps(selection)
-        # map 1: 0, map 2: 1, etc.
         maps_to_numbers = dict(zip(vote_dict.values(), vote_dict.keys()))
 
-        items = [
-            f"[{k}] {v} - {ranked_votes[v]}/{total_votes} votes"
-            for k, v in vote_dict.items()
-        ]
-
         if format_type == "vertical":
+            items = []
+            for k, map_obj in vote_dict.items():
+                localized_name = localize_map_name(map_obj)
+                vote_count = ranked_votes[map_obj]
+                items.append(f"[{k}] {localized_name} - {vote_count}/{total_votes} oy")
             return "\n".join(items)
+
         elif format_type.startswith("by_mod"):
             categorized = categorize_maps(selection)
-            # TODO: these aren't actually used anywhere
-            off = VoteMap.join_vote_options(
-                selection=categorized[maps.GameMode.OFFENSIVE],
-                maps_to_numbers=maps_to_numbers,
-                ranked_votes=ranked_votes,
-                total_votes=len(votes),
-                join_char="  ",
-            )
-            warfare = VoteMap.join_vote_options(
-                selection=categorized[maps.GameMode.WARFARE],
-                maps_to_numbers=maps_to_numbers,
-                ranked_votes=ranked_votes,
-                total_votes=len(votes),
-                join_char="  ",
-            )
-            # TODO: include skirmish
 
-            vote_string = ""
+            vote_string = []
+            # Warfare
             if categorized[maps.GameMode.WARFARE]:
                 vote_options = VoteMap.join_vote_options(
                     selection=categorized[maps.GameMode.WARFARE],
@@ -289,10 +324,10 @@ class VoteMap:
                     total_votes=len(votes),
                     join_char="\n",
                 )
-                vote_string = f"WARFARES:\n{vote_options}"
+                vote_string.append(f"WARFARES:\n{vote_options}")
+
+            # Offensive
             if categorized[maps.GameMode.OFFENSIVE]:
-                if vote_string:
-                    vote_string += "\n\n"
                 vote_options = VoteMap.join_vote_options(
                     selection=categorized[maps.GameMode.OFFENSIVE],
                     maps_to_numbers=maps_to_numbers,
@@ -300,10 +335,10 @@ class VoteMap:
                     total_votes=len(votes),
                     join_char="\n",
                 )
-                vote_string += f"OFFENSIVES:\n{vote_options}"
+                vote_string.append(f"OFFENSIVES:\n{vote_options}")
+
+            # Control / Skirmish
             if categorized[maps.GameMode.CONTROL]:
-                if vote_string:
-                    vote_string += "\n\n"
                 vote_options = VoteMap.join_vote_options(
                     selection=categorized[maps.GameMode.CONTROL],
                     maps_to_numbers=maps_to_numbers,
@@ -311,11 +346,17 @@ class VoteMap:
                     total_votes=len(votes),
                     join_char="\n",
                 )
-                vote_string += f"CONTROL SKIRMISHES:\n{vote_options}"
+                vote_string.append(f"CONTROL SKIRMISHES:\n{vote_options}")
 
-            return vote_string
+            return "\n\n".join(vote_string)
         else:
-            return ""
+            # Default fallback
+            items = []
+            for k, map_obj in vote_dict.items():
+                localized_name = localize_map_name(map_obj)
+                vote_count = ranked_votes[map_obj]
+                items.append(f"[{k}] {localized_name} - {vote_count}/{total_votes} oy")
+            return "\n".join(items)
 
     def get_last_reminder_time(self) -> datetime | None:
         as_date: datetime | None = None
@@ -338,7 +379,6 @@ class VoteMap:
             return False
 
         last_time = self.get_last_reminder_time()
-
         if last_time is None:
             logger.warning("No time for last vote reminder")
             return True
@@ -367,7 +407,6 @@ class VoteMap:
 
         self.set_last_reminder_time()
         players = rcon.get_playerids()
-        # Get optins
         player_ids = [player_id for _, player_id in players]
         opted_out = {}
 
@@ -414,7 +453,6 @@ class VoteMap:
         self, rcon, struct_log: StructuredLogLineWithMetaData
     ) -> bool:
         sub_content = struct_log.get("sub_content")
-
         message = sub_content.strip() if sub_content else ""
         config = VoteMapUserConfig.load_from_db()
         if not message.lower().startswith(("!votemap", "!vm")):
@@ -428,7 +466,6 @@ class VoteMap:
             logger.info("Registering vote %s", struct_log)
             vote = match.group(2)
             try:
-                # shouldn't be possible but making the type checker happy
                 player = (
                     struct_log["player_name_1"]
                     if struct_log["player_name_1"]
@@ -444,13 +481,15 @@ class VoteMap:
             except VoteMapNoInitialised:
                 rcon.message_player(
                     player_id=player_id_1,
-                    message="We can't register you vote at this time.\nVoteMap not initialised",
+                    message="We can't register your vote at this time.\nVoteMap not initialised",
                 )
                 raise
             else:
                 if msg := config.thank_you_text:
+                    # Burada da localize_map_name ile Türkçeleştirilmiş/kısaltılmış isim gösterebilirsiniz
+                    map_localized = localize_map_name(map_name) if isinstance(map_name, maps.Layer) else map_name
                     msg = msg.format(
-                        player_name=struct_log["player_name_1"], map_name=map_name
+                        player_name=struct_log["player_name_1"], map_name=map_localized
                     )
                     rcon.message_player(player_id=player_id_1, message=msg)
             finally:
@@ -560,7 +599,6 @@ class VoteMap:
 
     def register_vote(self, player_name: str, vote_timestamp: int, vote_content: str):
         try:
-            # Map history is used when generating selections
             current_map = MapsHistory()[0]
             min_time = current_map["start"]
         except IndexError as e:
@@ -582,7 +620,6 @@ class VoteMap:
         try:
             vote_idx = int(vote_content)
             selected_map = selection[vote_idx]
-            # Winston: utahbeach_warfare
             self.red.hset("VOTES", player_name, str(selected_map))
         except (TypeError, ValueError, IndexError):
             raise InvalidVoteError(
@@ -597,38 +634,19 @@ class VoteMap:
     def get_vote_overview(self) -> dict[maps.Layer, int] | None:
         try:
             votes = self.get_votes()
-            maps = Counter(votes.values()).most_common()
-
-            # take advantage of python dicts being ordered so the winner is always the first item
-            return {m: v for m, v in maps}
-
+            maps_ = Counter(votes.values()).most_common()
+            return {m: v for m, v in maps_}
         except Exception:
             logger.exception("Can't produce vote overview")
 
     def clear_votes(self) -> None:
-        """Clear all votes"""
         self.red.delete("VOTES")
 
     def has_voted(self, player_name: str) -> bool:
-        """Return if the player name has a value set"""
         return self.red.hget("VOTES", player_name) is not None
 
     def _get_votes(self) -> VoteMapPlayerVoteType:
-        """Returns a dict of player names and the map name they voted for"""
-        votes: dict[bytes, bytes] = self.red.hgetall("VOTES") or {}  # type: ignore
-        # Redis votes are a hash
-        # 127.0.0.1:6379[1]> HKEYS VOTES
-        # 1) "Winston"
-        # 2) "SodiumEnglish"
-        # 127.0.0.1:6379[1]> HGET VOTES Winston
-        # "hurtgenforest_warfare_v2_night"
-        # 127.0.0.1:6379[1]> HGET VOTES SodiumEnglish
-        # "kharkov_warfare"
-        # 127.0.0.1:6379[1]> HGETALL VOTES
-        # 1) "Winston"
-        # 2) "utahbeach_warfare"
-        # 3) "SodiumEnglish"
-        # 4) "foy_offensive_us"
+        votes: dict[bytes, bytes] = self.red.hgetall("VOTES") or {}
         return {k.decode(): v.decode() for k, v in votes.items()}
 
     def get_votes(self) -> dict[str, maps.Layer]:
@@ -636,11 +654,9 @@ class VoteMap:
         return {k: maps.parse_layer(v) for k, v in votes.items()}
 
     def get_map_whitelist(self) -> set[maps.Layer]:
-        """Return the set of map names on the whitelist or all possible game server maps if not configured"""
         res = self.red.get(self.whitelist_key)
         if res is not None:
             return pickle.loads(res)  # type: ignore
-
         return set(maps.parse_layer(map_) for map_ in self.rcon.get_maps())
 
     def add_map_to_whitelist(self, map_name: str):
@@ -648,7 +664,6 @@ class VoteMap:
             raise ValueError(
                 f"`{map_name}` is not a valid map on the game server, you may need to clear your cache"
             )
-
         whitelist = self.get_map_whitelist()
         whitelist.add(maps.parse_layer(map_name))
         self.set_map_whitelist(whitelist)
@@ -674,7 +689,6 @@ class VoteMap:
 
     def gen_selection(self):
         config = VoteMapUserConfig.load_from_db()
-
         logger.debug(
             f"""Generating new map selection for vote map with the following criteria:
             {self.rcon.get_maps()}
@@ -699,7 +713,6 @@ class VoteMap:
         logger.info("Saved new selection: %s", [m.pretty_name for m in selection])
 
     def _get_selection(self) -> list[str]:
-        """Return the current map suggestions"""
         return [v.decode() for v in self.red.lrange("MAP_SELECTION", 0, -1)]  # type: ignore
 
     def get_selection(self) -> list[maps.Layer]:
@@ -711,21 +724,19 @@ class VoteMap:
         self.red.delete("MAP_SELECTION")
         self.red.lpush("MAP_SELECTION", *[str(map_) for map_ in selection])
 
-    def pick_least_played_map(self, maps):
+    def pick_least_played_map(self, maps_list):
         maps_history = MapsHistory()
-
-        if not maps:
+        if not maps_list:
             raise ValueError("Can't pick a default. No maps to pick from")
 
         history = [obj["name"] for obj in maps_history]
         index = 0
-        for name in maps:
+        for name in maps_list:
             try:
                 idx = history.index(name)
             except ValueError:
                 return name
             index = max(idx, index)
-
         return history[index]
 
     def pick_default_next_map(self):
@@ -735,9 +746,7 @@ class VoteMap:
         all_maps = [maps.parse_layer(m) for m in self.rcon.get_maps()]
 
         if not config.allow_default_to_offensive:
-            logger.debug(
-                "Not allowing default to offensive, removing all offensive maps"
-            )
+            logger.debug("Not allowing default to offensive, removing all offensive maps")
             selection = [m for m in selection if m.game_mode != maps.GameMode.OFFENSIVE]
             all_maps = [m for m in all_maps if m.game_mode != maps.GameMode.OFFENSIVE]
 
@@ -750,7 +759,7 @@ class VoteMap:
             choice = random.choice([m for m in self.get_map_whitelist()])
             return choice
 
-        return {
+        method_dispatch = {
             DefaultMethods.least_played_suggestions: partial(
                 self.pick_least_played_map, selection
             ),
@@ -763,7 +772,8 @@ class VoteMap:
             DefaultMethods.random_suggestions: lambda: random.choice(
                 list(set(selection) - set([maps.parse_layer(maps_history[0]["name"])]))
             ),
-        }[config.default_method]()
+        }
+        return method_dispatch[config.default_method]()
 
     def apply_results(self):
         config = VoteMapUserConfig.load_from_db()
@@ -791,22 +801,18 @@ class VoteMap:
             logger.info(f"Winning map {next_map=}")
 
         rcon = get_rcon()
-        # Apply rotation safely
-
         current_rotation = rcon.get_map_rotation()
 
+        # Make sure only 1 map remains in rotation
         while len(current_rotation) > 1:
-            # Make sure only 1 map is in rotation
             map_ = current_rotation.pop(1)
             rcon.remove_map_from_rotation(map_.id)
 
         current_next_map = current_rotation[0]
         if current_next_map != next_map:
-            # Replace the only map left in rotation
             rcon.add_map_to_rotation(str(next_map))
             rcon.remove_map_from_rotation(current_next_map.id)
 
-        # Check that it worked
         current_rotation = rcon.get_map_rotation()
         if len(current_rotation) != 1 or current_rotation[0] != next_map:
             raise ValueError(
@@ -814,13 +820,12 @@ class VoteMap:
             )
 
         logger.info(
-            f"Successfully applied winning mapp {next_map=}, new rotation {current_rotation=}"
+            f"Successfully applied winning map {next_map=}, new rotation {current_rotation=}"
         )
         return True
 
     def apply_with_retry(self, nb_retry=2):
         success = False
-
         for i in range(nb_retry):
             try:
                 success = self.apply_results()
@@ -828,6 +833,5 @@ class VoteMap:
                 logger.exception("Applying vote map result failed.")
             else:
                 break
-
         if not success:
             logger.warning("Unable to set votemap results")
