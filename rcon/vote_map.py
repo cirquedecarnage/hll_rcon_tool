@@ -1,1296 +1,833 @@
+import logging
+import pickle
+import random
 import re
-from enum import Enum
-from logging import getLogger
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence, Union
+from datetime import datetime
+from functools import partial
+from typing import Counter, Iterable
 
-import pydantic
-import typing_extensions
-from requests.structures import CaseInsensitiveDict
-from typing_extensions import Literal
+import redis
+from sqlalchemy import and_
 
-logger = getLogger(__name__)
-
-RE_LAYER_NAME_SMALL = re.compile(
-    r"^(?P<tag>[A-Z]{3,5})_S_(?P<year>\d{4})_(?:(?P<environment>\w+)_)?P_(?P<game_mode>\w+)$"
+from rcon import maps
+from rcon.cache_utils import get_redis_client
+from rcon.maps import categorize_maps, numbered_maps, sort_maps_by_gamemode
+from rcon.models import PlayerID, PlayerOptins, enter_session
+from rcon.player_history import get_player
+from rcon.rcon import CommandFailedError, Rcon, get_rcon
+from rcon.types import (
+    StructuredLogLineWithMetaData,
+    VoteMapPlayerVoteType,
+    VoteMapResultType,
 )
-RE_LAYER_NAME_LARGE = re.compile(
-    r"^(?P<tag>[A-Z]{3,5})_L_(?P<year>\d{4})_(?P<game_mode>\w+?)(?P<attackers>US|GER|Ger|COM|USSR|RUS|GB|CW|Brit|British)?(?:_(?P<environment>\w+))?$"
-)
-RE_LEGACY_LAYER_NAME = re.compile(
-    r"^(?P<name>[a-z0-9]+)_(?:(?P<offensive>off(?:ensive)?)_?(?P<attackers>[a-zA-Z]+)|(?P<game_mode>[a-z]+)(?:_V2)?)(?:_(?P<environment>[a-z]+))?$"
-)
+from rcon.user_config.vote_map import DefaultMethods, VoteMapUserConfig
+from rcon.utils import MapsHistory
 
-UNKNOWN_MODE = "unknown"
-UNKNOWN_MAP_NAME = "unknown"
-UNKNOWN_MAP_TAG = "UNK"
+logger = logging.getLogger(__name__)
 
-
-# TypedDicts to represent the serialized output from the API and
-# pydantic model dumps to python dicts
-class MapType(typing_extensions.TypedDict):
-    id: str
-    name: str
-    tag: str
-    pretty_name: str
-    shortname: str
-    allies: "Faction"
-    axis: "Faction"
-    orientation: str
+####################
+#
+#  See hooks.py for the actual initialization of the vote map
+#
+#
+####################
 
 
-class LayerType(typing_extensions.TypedDict):
-    id: str
-    map: MapType
-    game_mode: str
-    attackers: str | None
-    environment: str
-    pretty_name: str
-    image_name: str
-    image_url: str | None
+class RestrictiveFilterError(Exception):
+    pass
 
 
-class FactionType(typing_extensions.TypedDict):
-    name: str
-    team: str
+class InvalidVoteError(Exception):
+    pass
 
 
-# Sourced with some minor modifications from https://github.com/timraay/Gamewatch/blob/master/
+class VoteMapNoInitialised(Exception):
+    pass
 
 
-# These pydantic models/enums can easily be copied in whole when writing Python code that
-# interacts with the CRCON API and enables much easier parsing of results
-# for example where result is a plain python dictionary containing a serialized Layer:
-# Layer.model_validate(result)
-class Orientation(str, Enum):
-    HORIZONTAL = "horizontal"
-    VERTICAL = "vertical"
-
-
-class GameMode(str, Enum):
-    WARFARE = "warfare"
-    OFFENSIVE = "offensive"
-    CONTROL = "control"
-    PHASED = "phased"
-    MAJORITY = "majority"
-
-    @classmethod
-    def large(cls):
-        return (
-            cls.WARFARE,
-            cls.OFFENSIVE,
-        )
-
-    @classmethod
-    def small(cls):
-        return (
-            cls.CONTROL,
-            cls.PHASED,
-            cls.MAJORITY,
-        )
-
-    def is_large(self):
-        return self in GameMode.large()
-
-    def is_small(self):
-        return self in GameMode.small()
-
-
-class Team(str, Enum):
-    ALLIES = "allies"
-    AXIS = "axis"
-    UNKNOWN = "unknown"
-
-
-class Environment(str, Enum):
-    DAWN = "dawn"
-    DAY = "day"
-    DUSK = "dusk"
-    NIGHT = "night"
-    OVERCAST = "overcast"
-    RAIN = "rain"
-
-
-class FactionName(Enum):
-    CW = "cw"
-    GB = "gb"
-    GER = "ger"
-    RUS = "rus"
-    US = "us"
-
-
-class Faction(pydantic.BaseModel):
-    name: str
-    team: Team
-
-
-class Map(pydantic.BaseModel):
-    id: str
-    name: str
-    tag: str
-    pretty_name: str
-    shortname: str
-    allies: "Faction"
-    axis: "Faction"
-    orientation: Orientation
-
-    def __str__(self) -> str:
-        return self.id
-
-    def __repr__(self) -> str:
-        return str(self)
-
-    def __hash__(self) -> int:
-        return hash(self.id)
-
-    def __eq__(self, other) -> bool:
-        if isinstance(other, (Map, str)):
-            return str(self).lower() == str(other).lower()
-        return NotImplemented
-
-
-class Layer(pydantic.BaseModel):
-    id: str
-    map: Map
-    game_mode: GameMode
-    attackers: Union[Team, None] = None
-    environment: Environment = Environment.DAY
-
-    def __str__(self) -> str:
-        return self.id
-
-    def __repr__(self) -> str:
-        return f"{self.__class__}(id={self.id}, map={self.map}, attackers={self.attackers}, environment={self.environment})"
-
-    def __hash__(self) -> int:
-        return hash(self.id)
-
-    def __eq__(self, other) -> bool:
-        if isinstance(other, (Layer, str)):
-            return str(self).lower() == str(other).lower()
-        return NotImplemented
-
-    if TYPE_CHECKING:
-        # Ensure type checkers see the correct return type
-        def model_dump(
-            self,
-            *,
-            mode: Literal["json", "python"] | str = "python",
-            include: Any = None,
-            exclude: Any = None,
-            by_alias: bool = False,
-            exclude_unset: bool = False,
-            exclude_defaults: bool = False,
-            exclude_none: bool = False,
-            round_trip: bool = False,
-            warnings: bool = True,
-        ) -> LayerType: ...
-
-    else:
-
-        def model_dump(self, **kwargs):
-            return super().model_dump(**kwargs)
-
-    @property
-    def attacking_faction(self):
-        if self.attackers == Team.ALLIES:
-            return self.map.allies
-        elif self.attackers == Team.AXIS:
-            return self.map.axis
-        return None
-
-    @pydantic.computed_field
-    @property
-    def pretty_name(self) -> str:
-        out = self.map.pretty_name
-        if self.game_mode == GameMode.OFFENSIVE:
-            out += " Off."
-            if self.attackers and self.attacking_faction:
-                out += f" {self.attacking_faction.name.upper()}"
-        elif self.game_mode.is_small():
-            # TODO: Remove once more Skirmish modes release
-            out += " Skirmish"
-        else:
-            out += f" {self.game_mode.value.capitalize()}"
-        if self.environment != Environment.DAY:
-            out += f" ({self.environment.value.title()})"
-        return out
-
-    @property
-    def opposite_side(self) -> Literal[Team.AXIS, Team.ALLIES] | None:
-        if self.attackers:
-            return get_opposite_side(self.attackers)
-
-    @pydantic.computed_field
-    @property
-    def image_name(self) -> str:
-        return f"{self.map.id}-{self.environment.value}.webp".lower()
-
-
-MAPS = {
-    m.id.lower(): m
-    for m in (
-        Map(
-            id=UNKNOWN_MAP_NAME,
-            name=UNKNOWN_MAP_NAME,
-            tag="",
-            pretty_name=UNKNOWN_MAP_NAME,
-            shortname=UNKNOWN_MAP_NAME,
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="stmereeglise",
-            name="SAINTE-MÈRE-ÉGLISE",
-            tag="SME",
-            pretty_name="St. Mere Eglise",
-            shortname="SME",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="stmariedumont",
-            name="ST MARIE DU MONT",
-            tag="BRC",
-            pretty_name="St. Marie Du Mont",
-            shortname="SMDM",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="utahbeach",
-            name="UTAH BEACH",
-            tag="UTA",
-            pretty_name="Utah Beach",
-            shortname="Utah",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="omahabeach",
-            name="OMAHA BEACH",
-            tag="OMA",
-            pretty_name="Omaha Beach",
-            shortname="Omaha",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="purpleheartlane",
-            name="PURPLE HEART LANE",
-            tag="PHL",
-            pretty_name="Purple Heart Lane",
-            shortname="PHL",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="carentan",
-            name="CARENTAN",
-            tag="CAR",
-            pretty_name="Carentan",
-            shortname="Carentan",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="hurtgenforest",
-            name="HÜRTGEN FOREST",
-            tag="HUR",
-            pretty_name="Hurtgen Forest",
-            shortname="Hurtgen",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="hill400",
-            name="HILL 400",
-            tag="HIL",
-            pretty_name="Hill 400",
-            shortname="Hill 400",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="foy",
-            name="FOY",
-            tag="FOY",
-            pretty_name="Foy",
-            shortname="Foy",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="kursk",
-            name="KURSK",
-            tag="KUR",
-            pretty_name="Kursk",
-            shortname="Kursk",
-            allies=Faction(name=FactionName.RUS.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="stalingrad",
-            name="STALINGRAD",
-            tag="STA",
-            pretty_name="Stalingrad",
-            shortname="Stalingrad",
-            allies=Faction(name=FactionName.RUS.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="remagen",
-            name="REMAGEN",
-            tag="REM",
-            pretty_name="Remagen",
-            shortname="Remagen",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="kharkov",
-            name="Kharkov",
-            tag="KHA",
-            pretty_name="Kharkov",
-            shortname="Kharkov",
-            allies=Faction(name=FactionName.RUS.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="driel",
-            name="DRIEL",
-            tag="DRL",
-            pretty_name="Driel",
-            shortname="Driel",
-            allies=Faction(name=FactionName.GB.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-        Map(
-            id="elalamein",
-            name="EL ALAMEIN",
-            tag="ELA",
-            pretty_name="El Alamein",
-            shortname="Alamein",
-            allies=Faction(name=FactionName.GB.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="mortain",
-            name="MORTAIN",
-            tag="MOR",
-            pretty_name="Mortain",
-            shortname="Mortain",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.HORIZONTAL,
-        ),
-        Map(
-            id="elsenbornridge",
-            name="ELSENBORN RIDGE",
-            tag="EBR",
-            pretty_name="Elsenborn Ridge",
-            shortname="Elsenborn",
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        ),
-    )
-}
-
-LAYERS = {
-    l.id.lower(): l
-    for l in (
-        # In older versions (prior to v9.8.0) map names could be recorded as bla_
-        # if the map name could not be retrieved from the game server
-        Layer(id="bla_", map=MAPS[UNKNOWN_MAP_NAME], game_mode=GameMode.WARFARE),
-        Layer(
-            id=UNKNOWN_MAP_NAME, map=MAPS[UNKNOWN_MAP_NAME], game_mode=GameMode.WARFARE
-        ),
-        Layer(
-            id="stmereeglise_warfare",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="stmereeglise_warfare_night",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="stmereeglise_offensive_us",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="stmereeglise_offensive_ger",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="SME_S_1944_Day_P_Skirmish",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAY,
-        ),
-        Layer(
-            id="SME_S_1944_Morning_P_Skirmish",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="SME_S_1944_Night_P_Skirmish",
-            map=MAPS["stmereeglise"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="stmariedumont_warfare",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="stmariedumont_warfare_night",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="stmariedumont_off_us",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="stmariedumont_off_ger",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="utahbeach_warfare",
-            map=MAPS["utahbeach"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="utahbeach_warfare_night",
-            map=MAPS["utahbeach"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="utahbeach_offensive_us",
-            map=MAPS["utahbeach"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="utahbeach_offensive_ger",
-            map=MAPS["utahbeach"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="omahabeach_warfare",
-            map=MAPS["omahabeach"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="omahabeach_warfare_night",
-            map=MAPS["omahabeach"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="omahabeach_offensive_us",
-            map=MAPS["omahabeach"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="omahabeach_offensive_ger",
-            map=MAPS["omahabeach"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        # PHL v1 (U15.2 and before)
-        Layer(
-            id="purpleheartlane_warfare",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="purpleheartlane_warfare_night",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="purpleheartlane_offensive_us",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="purpleheartlane_offensive_ger",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        # PHL v2 (U15.3 and after)
-        Layer(
-            id="PHL_L_1944_Warfare",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.RAIN,
-        ),
-        Layer(
-            id="PHL_L_1944_Warfare_Night",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="PHL_L_1944_OffensiveUS",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="PHL_L_1944_OffensiveGER",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="PHL_S_1944_Rain_P_Skirmish",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.RAIN,
-        ),
-        Layer(
-            id="PHL_S_1944_Morning_P_Skirmish",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="PHL_S_1944_Night_P_Skirmish",
-            map=MAPS["purpleheartlane"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="carentan_warfare",
-            map=MAPS["carentan"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="carentan_warfare_night",
-            map=MAPS["carentan"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="carentan_offensive_us",
-            map=MAPS["carentan"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="carentan_offensive_ger",
-            map=MAPS["carentan"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="CAR_S_1944_Day_P_Skirmish",
-            map=MAPS["carentan"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAY,
-        ),
-        Layer(
-            id="CAR_S_1944_Rain_P_Skirmish",
-            map=MAPS["carentan"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.RAIN,
-        ),
-        Layer(
-            id="CAR_S_1944_Dusk_P_Skirmish",
-            map=MAPS["carentan"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="hurtgenforest_warfare_V2",
-            map=MAPS["hurtgenforest"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="hurtgenforest_warfare_V2_night",
-            map=MAPS["hurtgenforest"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="hurtgenforest_offensive_US",
-            map=MAPS["hurtgenforest"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="hurtgenforest_offensive_ger",
-            map=MAPS["hurtgenforest"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="hill400_warfare",
-            map=MAPS["hill400"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="hill400_warfare_night",
-            map=MAPS["hill400"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="hill400_offensive_US",
-            map=MAPS["hill400"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="hill400_offensive_ger",
-            map=MAPS["hill400"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="HIL_S_1944_Day_P_Skirmish",
-            map=MAPS["hill400"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAY,
-        ),
-        Layer(
-            id="HIL_S_1944_Dusk_P_Skirmish",
-            map=MAPS["hill400"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="HIL_S_1944_Night_P_Skirmish",
-            map=MAPS["hill400"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="foy_warfare",
-            map=MAPS["foy"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="foy_warfare_night",
-            map=MAPS["foy"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="foy_offensive_us",
-            map=MAPS["foy"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="foy_offensive_ger",
-            map=MAPS["foy"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="FOY_S_1944_P_Skirmish",
-            map=MAPS["foy"],
-            game_mode=GameMode.CONTROL,
-        ),
-        Layer(
-            id="FOY_S_1944_Night_P_Skirmish",
-            map=MAPS["foy"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="kursk_warfare",
-            map=MAPS["kursk"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="kursk_warfare_night",
-            map=MAPS["kursk"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="kursk_offensive_rus",
-            map=MAPS["kursk"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="kursk_offensive_ger",
-            map=MAPS["kursk"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="stalingrad_warfare",
-            map=MAPS["stalingrad"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="stalingrad_warfare_night",
-            map=MAPS["stalingrad"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="stalingrad_offensive_rus",
-            map=MAPS["stalingrad"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="stalingrad_offensive_ger",
-            map=MAPS["stalingrad"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="remagen_warfare",
-            map=MAPS["remagen"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="remagen_warfare_night",
-            map=MAPS["remagen"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="remagen_offensive_us",
-            map=MAPS["remagen"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="remagen_offensive_ger",
-            map=MAPS["remagen"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="kharkov_warfare",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="kharkov_warfare_night",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="kharkov_offensive_rus",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="kharkov_offensive_ger",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="KHA_S_1944_P_Skirmish",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.CONTROL,
-        ),
-        Layer(
-            id="KHA_S_1944_Night_P_Skirmish",
-            map=MAPS["kharkov"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="driel_warfare",
-            map=MAPS["driel"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="driel_warfare_night",
-            map=MAPS["driel"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="driel_offensive_us",
-            map=MAPS["driel"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="driel_offensive_ger",
-            map=MAPS["driel"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="DRL_S_1944_P_Skirmish",
-            map=MAPS["driel"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="DRL_S_1944_Night_P_Skirmish",
-            map=MAPS["driel"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="DRL_S_1944_Day_P_Skirmish",
-            map=MAPS["driel"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAY,
-        ),
-        Layer(
-            id="elalamein_warfare",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="elalamein_warfare_night",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="elalamein_offensive_CW",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="elalamein_offensive_ger",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="ELA_S_1942_P_Skirmish",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAY,
-        ),
-        Layer(
-            id="ELA_S_1942_Night_P_Skirmish",
-            map=MAPS["elalamein"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="SMDM_S_1944_Day_P_Skirmish",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.CONTROL,
-        ),
-        Layer(
-            id="SMDM_S_1944_Night_P_Skirmish",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="SMDM_S_1944_Rain_P_Skirmish",
-            map=MAPS["stmariedumont"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.RAIN,
-        ),
-        Layer(
-            id="mortain_warfare_day",
-            map=MAPS["mortain"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="mortain_warfare_dusk",
-            map=MAPS["mortain"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="mortain_warfare_overcast",
-            map=MAPS["mortain"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.OVERCAST,
-        ),
-        Layer(
-            id="mortain_warfare_night",
-            map=MAPS["mortain"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="mortain_offensiveUS_day",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="mortain_offensiveUS_overcast",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.OVERCAST,
-        ),
-        Layer(
-            id="mortain_offensiveUS_dusk",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="mortain_offensiveUS_night",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="mortain_offensiveger_day",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="mortain_offensiveger_overcast",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.OVERCAST,
-        ),
-        Layer(
-            id="mortain_offensiveger_dusk",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="mortain_offensiveger_night",
-            map=MAPS["mortain"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="mortain_skirmish_day",
-            map=MAPS["mortain"],
-            game_mode=GameMode.CONTROL,
-        ),
-        Layer(
-            id="mortain_skirmish_overcast",
-            map=MAPS["mortain"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.OVERCAST,
-        ),
-        Layer(
-            id="mortain_skirmish_dusk",
-            map=MAPS["mortain"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="mortain_skirmish_night",
-            map=MAPS["mortain"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="elsenbornridge_warfare_day",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.WARFARE,
-        ),
-        Layer(
-            id="elsenbornridge_warfare_morning",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="elsenbornridge_warfare_evening",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="elsenbornridge_warfare_night",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.WARFARE,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveUS_day",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveUS_morning",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveUS_evening",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveUS_night",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.ALLIES,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveger_day",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveger_morning",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveger_evening",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="elsenbornridge_offensiveger_night",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.OFFENSIVE,
-            attackers=Team.AXIS,
-            environment=Environment.NIGHT,
-        ),
-        Layer(
-            id="elsenbornridge_skirmish_day",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.CONTROL,
-        ),
-        Layer(
-            id="elsenbornridge_skirmish_morning",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DAWN,
-        ),
-        Layer(
-            id="elsenbornridge_skirmish_evening",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.DUSK,
-        ),
-        Layer(
-            id="elsenbornridge_skirmish_night",
-            map=MAPS["elsenbornridge"],
-            game_mode=GameMode.CONTROL,
-            environment=Environment.NIGHT,
-        ),
-    )
-}
-
-
-def parse_layer(layer_name: str | Layer) -> Layer:
-    if isinstance(layer_name, Layer):
-        layer_name = str(layer_name)
-    elif is_server_loading_map(map_name=layer_name):
-        return LAYERS[UNKNOWN_MAP_NAME]
-
-    layer = LAYERS.get(layer_name.lower())
-    if layer:
-        return layer
-
-    getLogger().warning("Unknown layer %s", layer_name)
-
-    layer_match = RE_LAYER_NAME_LARGE.match(layer_name) or RE_LAYER_NAME_SMALL.match(
-        layer_name
-    )
-    if not layer_match:
-        return _parse_legacy_layer(layer_name)
-
-    layer_data = layer_match.groupdict()
-
-    tag = layer_data["tag"]
-    map_ = None
-    for m in MAPS.values():
-        if m.tag == tag:
-            map_ = m
-            break
-    if map_ is None:
-        map_ = Map(
-            id=tag.lower(),
-            name=tag,
-            tag=tag,
-            pretty_name=tag.capitalize(),
-            shortname=tag,
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
-        )
-
-    attackers = None
+def _get_random_map_selection(
+    maps: list[maps.Layer], nb_to_return: int, history=None
+) -> list[maps.Layer]:
+    # if history:
+    # Calculate weights to stir selection towards least played maps
     try:
-        game_mode = GameMode[layer_data["game_mode"].upper()]
-    except KeyError:
-        game_mode = GameMode.WARFARE
-    else:
-        if game_mode == GameMode.OFFENSIVE:
-            attackers = Team.ALLIES
-
-    if layer_data["environment"]:
-        try:
-            environment = Environment[layer_data["environment"].upper()]
-        except KeyError:
-            environment = Environment.DAY
-    else:
-        environment = Environment.DAY
-
-    return Layer(
-        id=layer_name,
-        map=map_,
-        game_mode=game_mode,
-        attackers=attackers,
-        environment=environment,
-    )
+        if nb_to_return > 0 and len(maps) < nb_to_return:
+            nb_to_return = len(maps)
+        return random.sample(maps, k=nb_to_return)
+    except (IndexError, ValueError):
+        return []
 
 
-def _parse_legacy_layer(layer_name: str):
-    layer_match = RE_LEGACY_LAYER_NAME.match(layer_name)
-    if not layer_match:
-        raise ValueError("Unparsable layer '%s'" % layer_name)
-
-    layer_data = layer_match.groupdict()
-
-    name = layer_data["name"]
-    map_ = MAPS.get(layer_data["name"].lower())
-    if not map_:
-        map_ = Map(
-            id=name,
-            name=name.capitalize(),
-            tag=name.upper(),
-            pretty_name=name.capitalize(),
-            shortname=name.capitalize(),
-            allies=Faction(name=FactionName.US.value, team=Team.ALLIES),
-            axis=Faction(name=FactionName.GER.value, team=Team.AXIS),
-            orientation=Orientation.VERTICAL,
+def suggest_next_maps(
+    maps_history: MapsHistory,
+    current_map: maps.Layer,
+    whitelist_maps: set[maps.Layer],
+    num_warfare: int,
+    num_offensive: int,
+    num_skirmish_control: int,
+    exclude_last_n: int = 4,
+    consider_offensive_as_same_map: bool = True,
+    allow_consecutive_offensive: bool = True,
+    allow_consecutive_offensives_of_opposite_side: bool = False,
+    consider_skirmishes_as_same_map: bool = True,
+    allow_consecutive_skirmishes: bool = True,
+):
+    history_as_layers = [maps.parse_layer(m["name"]) for m in maps_history]
+    try:
+        return _suggest_next_maps(
+            maps_history=history_as_layers,
+            current_map=current_map,
+            allowed_maps=whitelist_maps,
+            num_warfare=num_warfare,
+            num_offensive=num_offensive,
+            num_skirmish_control=num_skirmish_control,
+            exclude_last_n=exclude_last_n,
+            consider_offensive_as_same_map=consider_offensive_as_same_map,
+            allow_consecutive_offensive=allow_consecutive_offensive,
+            allow_consecutive_offensives_of_opposite_side=allow_consecutive_offensives_of_opposite_side,
+            consider_skirmishes_as_same_map=consider_skirmishes_as_same_map,
+            allow_consecutive_skirmishes=allow_consecutive_skirmishes,
+        )
+    except RestrictiveFilterError:
+        logger.warning(
+            "Falling back on all possible maps since the filters are too restrictive"
+        )
+        rcon = get_rcon()
+        return _suggest_next_maps(
+            maps_history=history_as_layers,
+            current_map=current_map,
+            allowed_maps=set(maps.parse_layer(m) for m in rcon.get_maps()),
+            num_warfare=num_warfare,
+            num_offensive=num_offensive,
+            num_skirmish_control=num_skirmish_control,
+            exclude_last_n=exclude_last_n,
+            consider_offensive_as_same_map=consider_offensive_as_same_map,
+            allow_consecutive_offensive=allow_consecutive_offensive,
+            allow_consecutive_offensives_of_opposite_side=allow_consecutive_offensives_of_opposite_side,
+            consider_skirmishes_as_same_map=consider_skirmishes_as_same_map,
+            allow_consecutive_skirmishes=allow_consecutive_skirmishes,
         )
 
-    result = Layer(id=layer_name, map=map_, game_mode=GameMode.WARFARE)
 
-    if layer_data["offensive"]:
-        result.game_mode = GameMode.OFFENSIVE
-        try:
-            result.attackers = Team[FactionName[layer_data["attackers"].upper()].value]
-        except KeyError:
-            pass
-
-    elif layer_data["game_mode"]:
-        try:
-            result.game_mode = GameMode[layer_data["game_mode"].upper()]
-        except KeyError:
-            pass
-
-    environment = layer_data["environment"]
-    if environment:
-        try:
-            result.environment = Environment[environment.upper()]
-        except KeyError:
-            pass
-
-    return result
-
-
-def get_opposite_side(team: Team) -> Literal[Team.AXIS, Team.ALLIES]:
-    return Team.AXIS if team == Team.ALLIES else Team.ALLIES
-
-
-def sort_maps_by_gamemode(maps: Sequence[Layer]) -> list[Layer]:
-    warfare = [m for m in maps if m.game_mode == GameMode.WARFARE]
-    offensive = [m for m in maps if m.game_mode == GameMode.OFFENSIVE]
-    control = [m for m in maps if m.game_mode == GameMode.CONTROL]
-    phased = [m for m in maps if m.game_mode == GameMode.PHASED]
-    majority = [m for m in maps if m.game_mode == GameMode.MAJORITY]
-
-    return warfare + offensive + control + phased + majority
-
-
-def numbered_maps(maps: list[Layer]) -> dict[str, Layer]:
-    # Control the order of the maps so they present in a sensible fashion in messages
-    ordered_maps = sort_maps_by_gamemode(maps)
-    return {str(idx): map_ for idx, map_ in enumerate(ordered_maps)}
-
-
-def categorize_maps(maps: Iterable[Layer]) -> dict[GameMode, list[Layer]]:
-    categories = {
-        GameMode.OFFENSIVE: [
-            map_ for map_ in maps if map_.game_mode == GameMode.OFFENSIVE
-        ],
-        GameMode.WARFARE: [map_ for map_ in maps if map_.game_mode == GameMode.WARFARE],
-        GameMode.CONTROL: [map_ for map_ in maps if map_.game_mode == GameMode.CONTROL],
-    }
-
-    return categories
-
-
-def safe_get_map_name(map_name: str, pretty: bool = True) -> str:
-    """Return the RCON map name if not found"""
-    map_ = parse_layer(map_name)
-
-    if map_ is None:
-        return map_name
-
-    if pretty:
-        return map_.pretty_name
+def _suggest_next_maps(
+    maps_history: list[maps.Layer],
+    current_map: maps.Layer,
+    allowed_maps: set[maps.Layer],
+    exclude_last_n: int,
+    num_warfare: int,
+    num_offensive: int,
+    num_skirmish_control: int,
+    consider_offensive_as_same_map: bool,
+    allow_consecutive_offensive: bool,
+    allow_consecutive_offensives_of_opposite_side: bool,
+    consider_skirmishes_as_same_map: bool,
+    allow_consecutive_skirmishes: bool,
+) -> list[maps.Layer]:
+    if exclude_last_n > 0:
+        last_n_maps = set(m for m in maps_history[:exclude_last_n])
     else:
-        return map_.map.name
+        last_n_maps: set[maps.Layer] = set()
+    logger.info(
+        "Excluding last %s player maps: %s",
+        exclude_last_n,
+        [m.pretty_name for m in last_n_maps],
+    )
+    remaining_maps = [maps.parse_layer(m) for m in allowed_maps - last_n_maps]
+    logger.info(
+        "Remaining maps to suggest from: %s", [m.pretty_name for m in remaining_maps]
+    )
+
+    current_side = current_map.attackers
+
+    if consider_offensive_as_same_map or consider_skirmishes_as_same_map:
+        # use the id `carentan`, `hill400` etc. to get the base map regardless of game type
+        map_ids = set(m.map for m in last_n_maps)
+        logger.info(
+            "Considering offensive/skirmish mode as same map, excluding %s", map_ids
+        )
+        remaining_maps = [
+            maps.parse_layer(m) for m in remaining_maps if m.map not in map_ids
+        ]
+        logger.info(
+            "Remaining maps to suggest from: %s",
+            [m.pretty_name for m in remaining_maps],
+        )
+
+    if not allow_consecutive_offensives_of_opposite_side and current_side:
+        # TODO: make sure this is correct
+        remaining_maps = [
+            maps.parse_layer(m)
+            for m in remaining_maps
+            if m.opposite_side != current_side
+        ]
+        logger.info(
+            "Not allowing consecutive offensive with opposite side: %s",
+            maps.get_opposite_side(current_side),
+        )
+        logger.info(
+            "Remaining maps to suggest from: %s",
+            [m.pretty_name for m in remaining_maps],
+        )
+
+    # Handle case if all maps got excluded
+    categorized_maps = categorize_maps(remaining_maps)
+
+    warfares: list[maps.Layer] = _get_random_map_selection(
+        categorized_maps[maps.GameMode.WARFARE], num_warfare
+    )
+    offensives: list[maps.Layer] = _get_random_map_selection(
+        categorized_maps[maps.GameMode.OFFENSIVE], num_offensive
+    )
+    skirmishes_control: list[maps.Layer] = _get_random_map_selection(
+        categorized_maps[maps.GameMode.CONTROL], num_skirmish_control
+    )
+
+    if (
+        not allow_consecutive_offensive
+        and current_map.game_mode == maps.GameMode.OFFENSIVE
+    ):
+        logger.info(
+            "Current map %s is offensive. Excluding all offensives from suggestions",
+            current_map,
+        )
+        offensives = []
+
+    if not allow_consecutive_skirmishes and current_map.game_mode in (
+        maps.GameMode.CONTROL,
+        maps.GameMode.PHASED,
+        maps.GameMode.MAJORITY,
+    ):
+        logger.info(
+            "Current map %s is skirmish. Excluding all skirmishes from suggestions",
+            current_map,
+        )
+        skirmishes_control = []
+
+    selection = sort_maps_by_gamemode(offensives + warfares + skirmishes_control)
+
+    if not selection:
+        logger.error("No maps can be suggested with the given parameters.")
+        raise RestrictiveFilterError("Unable to suggest map")
+
+    logger.info("Suggestion %s", [m.pretty_name for m in selection])
+    return selection
 
 
-def is_server_loading_map(map_name: str) -> bool:
-    return "untitled" in map_name.lower()
+# TODO:  Handle empty selection (None)
+class VoteMap:
+    def __init__(self) -> None:
+        self.rcon = get_rcon()
+        self.red = get_redis_client()
+        self.reminder_time_key = "last_vote_reminder"
+        self.optin_name = "votemap_reminder"
+        self.whitelist_key = "votemap_whitelist"
+
+    # TODO: fix votes typing
+    @staticmethod
+    def join_vote_options(
+        selection: list[maps.Layer],
+        maps_to_numbers: dict[maps.Layer, str],
+        ranked_votes: Counter[maps.Layer],
+        total_votes: int,
+        join_char: str = " ",
+    ) -> str:
+        return join_char.join(
+            f"[{maps_to_numbers[m]}] {m.pretty_name} - {ranked_votes[m]}/{total_votes} votes"
+            for m in selection
+        )
+
+    @staticmethod
+    def format_map_vote(
+        selection: list[maps.Layer],
+        votes: dict[str, maps.Layer],
+        format_type="vertical",
+    ) -> str:
+        if len(selection) == 0:
+            logger.warning("No vote map selection")
+            return ""
+
+        total_votes = len(votes)
+        ranked_votes = Counter(votes.values())
+
+        # 0: map 1, 1: map 2, etc.
+        vote_dict = numbered_maps(selection)
+        # map 1: 0, map 2: 1, etc.
+        maps_to_numbers = dict(zip(vote_dict.values(), vote_dict.keys()))
+
+        items = [
+            f"[{k}] {v} - {ranked_votes[v]}/{total_votes} votes"
+            for k, v in vote_dict.items()
+        ]
+
+        if format_type == "vertical":
+            return "\n".join(items)
+        elif format_type.startswith("by_mod"):
+            categorized = categorize_maps(selection)
+            # TODO: these aren't actually used anywhere
+            off = VoteMap.join_vote_options(
+                selection=categorized[maps.GameMode.OFFENSIVE],
+                maps_to_numbers=maps_to_numbers,
+                ranked_votes=ranked_votes,
+                total_votes=len(votes),
+                join_char="  ",
+            )
+            warfare = VoteMap.join_vote_options(
+                selection=categorized[maps.GameMode.WARFARE],
+                maps_to_numbers=maps_to_numbers,
+                ranked_votes=ranked_votes,
+                total_votes=len(votes),
+                join_char="  ",
+            )
+            # TODO: include skirmish
+
+            vote_string = ""
+            if categorized[maps.GameMode.WARFARE]:
+                vote_options = VoteMap.join_vote_options(
+                    selection=categorized[maps.GameMode.WARFARE],
+                    maps_to_numbers=maps_to_numbers,
+                    ranked_votes=ranked_votes,
+                    total_votes=len(votes),
+                    join_char="\n",
+                )
+                vote_string = f"WARFARES:\n{vote_options}"
+            if categorized[maps.GameMode.OFFENSIVE]:
+                if vote_string:
+                    vote_string += "\n\n"
+                vote_options = VoteMap.join_vote_options(
+                    selection=categorized[maps.GameMode.OFFENSIVE],
+                    maps_to_numbers=maps_to_numbers,
+                    ranked_votes=ranked_votes,
+                    total_votes=len(votes),
+                    join_char="\n",
+                )
+                vote_string += f"OFFENSIVES:\n{vote_options}"
+            if categorized[maps.GameMode.CONTROL]:
+                if vote_string:
+                    vote_string += "\n\n"
+                vote_options = VoteMap.join_vote_options(
+                    selection=categorized[maps.GameMode.CONTROL],
+                    maps_to_numbers=maps_to_numbers,
+                    ranked_votes=ranked_votes,
+                    total_votes=len(votes),
+                    join_char="\n",
+                )
+                vote_string += f"CONTROL SKIRMISHES:\n{vote_options}"
+
+            return vote_string
+        else:
+            return ""
+
+    def get_last_reminder_time(self) -> datetime | None:
+        as_date: datetime | None = None
+        res: bytes = self.red.get(self.reminder_time_key)  # type: ignore
+        if res is not None:
+            as_date = pickle.loads(res)
+        return as_date
+
+    def set_last_reminder_time(self, the_time: datetime | None = None) -> None:
+        dt = the_time or datetime.now()
+        self.red.set(self.reminder_time_key, pickle.dumps(dt))
+
+    def reset_last_reminder_time(self) -> None:
+        self.red.delete(self.reminder_time_key)
+
+    def is_time_for_reminder(self) -> bool:
+        config = VoteMapUserConfig.load_from_db()
+        reminder_freq_min = config.reminder_frequency_minutes
+        if reminder_freq_min == 0:
+            return False
+
+        last_time = self.get_last_reminder_time()
+
+        if last_time is None:
+            logger.warning("No time for last vote reminder")
+            return True
+
+        if (datetime.now() - last_time).total_seconds() > reminder_freq_min * 60:
+            return True
+
+        return False
+
+    def vote_map_reminder(self, rcon: Rcon, force=False):
+        logger.info("Vote MAP reminder")
+        config = VoteMapUserConfig.load_from_db()
+        vote_map_message = config.instruction_text
+
+        if not config.enabled:
+            return
+
+        if not self.is_time_for_reminder() and not force:
+            return
+
+        if "{map_selection}" not in vote_map_message:
+            logger.error(
+                "Vote map is not configured properly, {map_selection} is not present in the instruction text"
+            )
+            return
+
+        self.set_last_reminder_time()
+        players = rcon.get_playerids()
+        # Get optins
+        player_ids = [player_id for _, player_id in players]
+        opted_out = {}
+
+        try:
+            with enter_session() as sess:
+                res = (
+                    sess.query(PlayerOptins)
+                    .join(PlayerID)
+                    .filter(
+                        and_(
+                            PlayerID.player_id.in_(player_ids),
+                            PlayerOptins.optin_name == self.optin_name,
+                            PlayerOptins.optin_value == "false",
+                        )
+                    )
+                    .all()
+                )
+                opted_out = {p.player.player_id for p in res}
+        except Exception:
+            logger.exception("Can't get optins")
+
+        for name, player_id in players:
+            if self.has_voted(name) or (
+                player_id in opted_out and config.allow_opt_out
+            ):
+                logger.info("Not showing reminder to %s", name)
+                continue
+
+            try:
+                rcon.message_player(
+                    player_id=player_id,
+                    message=vote_map_message.format(
+                        map_selection=self.format_map_vote(
+                            selection=self.get_selection(),
+                            votes=self.get_votes(),
+                            format_type="by_mod_vertical_all",
+                        )
+                    ),
+                )
+            except CommandFailedError:
+                logger.warning("Unable to message %s", name)
+
+    def handle_vote_command(
+        self, rcon, struct_log: StructuredLogLineWithMetaData
+    ) -> bool:
+        sub_content = struct_log.get("sub_content")
+
+        message = sub_content.strip() if sub_content else ""
+        config = VoteMapUserConfig.load_from_db()
+        if not message.lower().startswith(("!votemap", "!vm")):
+            return config.enabled
+
+        player_id_1 = struct_log["player_id_1"]
+        if not config.enabled:
+            return config.enabled
+
+        if match := re.match(r"(!votemap|!vm)\s*(\d+)", message, re.IGNORECASE):
+            logger.info("Registering vote %s", struct_log)
+            vote = match.group(2)
+            try:
+                # shouldn't be possible but making the type checker happy
+                player = (
+                    struct_log["player_name_1"]
+                    if struct_log["player_name_1"]
+                    else "PlayerNameNotFound"
+                )
+                map_name = self.register_vote(
+                    player, struct_log["timestamp_ms"] // 1000, vote
+                )
+            except InvalidVoteError:
+                rcon.message_player(player_id=player_id_1, message="Invalid vote.")
+                if config.help_text:
+                    rcon.message_player(player_id=player_id_1, message=config.help_text)
+            except VoteMapNoInitialised:
+                rcon.message_player(
+                    player_id=player_id_1,
+                    message="We can't register you vote at this time.\nVoteMap not initialised",
+                )
+                raise
+            else:
+                if msg := config.thank_you_text:
+                    msg = msg.format(
+                        player_name=struct_log["player_name_1"], map_name=map_name
+                    )
+                    rcon.message_player(player_id=player_id_1, message=msg)
+            finally:
+                self.apply_results()
+                return config.enabled
+
+        if (
+            re.match(r"(!votemap|!vm)\s*help", message, re.IGNORECASE)
+            and config.help_text
+        ):
+            logger.info("Showing help %s", struct_log)
+            rcon.message_player(player_id=player_id_1, message=config.help_text)
+            return config.enabled
+
+        if re.match(r"(!votemap|!vm)$", message, re.IGNORECASE):
+            logger.info("Showing selection %s", struct_log)
+            vote_map_message = config.instruction_text
+            rcon.message_player(
+                player_id=player_id_1,
+                message=vote_map_message.format(
+                    map_selection=self.format_map_vote(
+                        selection=self.get_selection(),
+                        votes=self.get_votes(),
+                        format_type="by_mod_vertical_all",
+                    )
+                ),
+            )
+            return config.enabled
+
+        if re.match(r"(!votemap|!vm)\s*never$", message, re.IGNORECASE):
+            if not config.allow_opt_out:
+                rcon.message_player(
+                    player_id=player_id_1,
+                    message="You can't opt-out of vote map on this server",
+                )
+                return config.enabled
+
+            logger.info("Player opting out of vote %s", struct_log)
+            with enter_session() as sess:
+                player = get_player(sess, player_id_1)
+                existing = (
+                    sess.query(PlayerOptins)
+                    .filter(
+                        and_(
+                            PlayerOptins.player_id_id == player.id,
+                            PlayerOptins.optin_name == self.optin_name,
+                        )
+                    )
+                    .one_or_none()
+                )
+                if existing:
+                    existing.optin_value = "false"
+                else:
+                    sess.add(
+                        PlayerOptins(
+                            player=player,
+                            optin_name=self.optin_name,
+                            optin_value="false",
+                        )
+                    )
+                try:
+                    sess.commit()
+                    rcon.message_player(
+                        player_id=player_id_1, message="VoteMap Unsubscribed OK"
+                    )
+                except Exception as e:
+                    logger.exception("Unable to add optin. Already exists?")
+                self.apply_with_retry()
+
+            return config.enabled
+
+        if re.match(r"(!votemap|!vm)\s*allow$", message, re.IGNORECASE):
+            logger.info("Player opting in for vote %s", struct_log)
+            with enter_session() as sess:
+                player = get_player(sess, player_id_1)
+                existing = (
+                    sess.query(PlayerOptins)
+                    .filter(
+                        and_(
+                            PlayerOptins.player_id_id == player.id,
+                            PlayerOptins.optin_name == self.optin_name,
+                        )
+                    )
+                    .one_or_none()
+                )
+                if existing:
+                    existing.optin_value = "true"
+                else:
+                    sess.add(
+                        PlayerOptins(
+                            player=player,
+                            optin_name=self.optin_name,
+                            optin_value="true",
+                        )
+                    )
+                try:
+                    sess.commit()
+                    rcon.message_player(
+                        player_id=player_id_1, message="VoteMap Subscribed OK"
+                    )
+                except Exception as e:
+                    logger.exception("Unable to update optin. Already exists?")
+            return config.enabled
+
+        rcon.message_player(player_id=player_id_1, message=config.help_text)
+        return config.enabled
+
+    def register_vote(self, player_name: str, vote_timestamp: int, vote_content: str):
+        try:
+            # Map history is used when generating selections
+            current_map = MapsHistory()[0]
+            min_time = current_map["start"]
+        except IndexError as e:
+            raise VoteMapNoInitialised(
+                "Map history is empty - Can't register vote"
+            ) from e
+        except KeyError as e:
+            raise VoteMapNoInitialised(
+                "Map history is corrupted - Can't register vote"
+            ) from e
+
+        if min_time is None or vote_timestamp < min_time:
+            logger.warning(
+                f"Vote is too old {player_name=}, {vote_timestamp=}, {vote_content=}, {current_map=}"
+            )
+
+        selection = self.get_selection()
+
+        try:
+            vote_idx = int(vote_content)
+            selected_map = selection[vote_idx]
+            # Winston: utahbeach_warfare
+            self.red.hset("VOTES", player_name, str(selected_map))
+        except (TypeError, ValueError, IndexError):
+            raise InvalidVoteError(
+                f"Vote must be a number between 0 and {len(selection) - 1}"
+            )
+
+        logger.info(
+            f"Registered vote from {player_name=} for {selected_map=} - {vote_content=}"
+        )
+        return selected_map
+
+    def get_vote_overview(self) -> dict[maps.Layer, int] | None:
+        try:
+            votes = self.get_votes()
+            maps = Counter(votes.values()).most_common()
+
+            # take advantage of python dicts being ordered so the winner is always the first item
+            return {m: v for m, v in maps}
+
+        except Exception:
+            logger.exception("Can't produce vote overview")
+
+    def clear_votes(self) -> None:
+        """Clear all votes"""
+        self.red.delete("VOTES")
+
+    def has_voted(self, player_name: str) -> bool:
+        """Return if the player name has a value set"""
+        return self.red.hget("VOTES", player_name) is not None
+
+    def _get_votes(self) -> VoteMapPlayerVoteType:
+        """Returns a dict of player names and the map name they voted for"""
+        votes: dict[bytes, bytes] = self.red.hgetall("VOTES") or {}  # type: ignore
+        # Redis votes are a hash
+        # 127.0.0.1:6379[1]> HKEYS VOTES
+        # 1) "Winston"
+        # 2) "SodiumEnglish"
+        # 127.0.0.1:6379[1]> HGET VOTES Winston
+        # "hurtgenforest_warfare_v2_night"
+        # 127.0.0.1:6379[1]> HGET VOTES SodiumEnglish
+        # "kharkov_warfare"
+        # 127.0.0.1:6379[1]> HGETALL VOTES
+        # 1) "Winston"
+        # 2) "utahbeach_warfare"
+        # 3) "SodiumEnglish"
+        # 4) "foy_offensive_us"
+        return {k.decode(): v.decode() for k, v in votes.items()}
+
+    def get_votes(self) -> dict[str, maps.Layer]:
+        votes = self._get_votes()
+        return {k: maps.parse_layer(v) for k, v in votes.items()}
+
+    def get_map_whitelist(self) -> set[maps.Layer]:
+        """Return the set of map names on the whitelist or all possible game server maps if not configured"""
+        res = self.red.get(self.whitelist_key)
+        if res is not None:
+            return pickle.loads(res)  # type: ignore
+
+        return set(maps.parse_layer(map_) for map_ in self.rcon.get_maps())
+
+    def add_map_to_whitelist(self, map_name: str):
+        if map_name not in self.rcon.get_maps():
+            raise ValueError(
+                f"`{map_name}` is not a valid map on the game server, you may need to clear your cache"
+            )
+
+        whitelist = self.get_map_whitelist()
+        whitelist.add(maps.parse_layer(map_name))
+        self.set_map_whitelist(whitelist)
+
+    def add_maps_to_whitelist(self, map_names: Iterable[str]):
+        for map_name in map_names:
+            self.add_map_to_whitelist(map_name.lower())
+
+    def remove_map_from_whitelist(self, map_name: str):
+        whitelist = self.get_map_whitelist()
+        whitelist.discard(maps.parse_layer(map_name))
+        self.set_map_whitelist(whitelist)
+
+    def remove_maps_from_whitelist(self, map_names):
+        for map_name in map_names:
+            self.remove_map_from_whitelist(map_name)
+
+    def reset_map_whitelist(self):
+        self.set_map_whitelist(self.rcon.get_maps())
+
+    def set_map_whitelist(self, map_names) -> None:
+        self.red.set(self.whitelist_key, pickle.dumps(set(map_names)))
+
+    def gen_selection(self):
+        config = VoteMapUserConfig.load_from_db()
+
+        logger.debug(
+            f"""Generating new map selection for vote map with the following criteria:
+            {self.rcon.get_maps()}
+            {config}
+        """
+        )
+        selection = suggest_next_maps(
+            maps_history=MapsHistory(),
+            current_map=self.rcon.current_map,
+            whitelist_maps=self.get_map_whitelist(),
+            num_warfare=config.num_warfare_options,
+            num_offensive=config.num_offensive_options,
+            num_skirmish_control=config.num_skirmish_control_options,
+            exclude_last_n=config.number_last_played_to_exclude,
+            consider_offensive_as_same_map=config.consider_offensive_same_map,
+            consider_skirmishes_as_same_map=config.consider_skirmishes_as_same_map,
+            allow_consecutive_offensive=config.allow_consecutive_offensives,
+            allow_consecutive_offensives_of_opposite_side=config.allow_consecutive_offensives_opposite_sides,
+        )
+
+        self.set_selection(selection=selection)
+        logger.info("Saved new selection: %s", [m.pretty_name for m in selection])
+
+    def _get_selection(self) -> list[str]:
+        """Return the current map suggestions"""
+        return [v.decode() for v in self.red.lrange("MAP_SELECTION", 0, -1)]  # type: ignore
+
+    def get_selection(self) -> list[maps.Layer]:
+        return sort_maps_by_gamemode(
+            [maps.parse_layer(name) for name in self._get_selection()]
+        )
+
+    def set_selection(self, selection: Iterable[maps.Layer]) -> None:
+        self.red.delete("MAP_SELECTION")
+        self.red.lpush("MAP_SELECTION", *[str(map_) for map_ in selection])
+
+    def pick_least_played_map(self, maps):
+        maps_history = MapsHistory()
+
+        if not maps:
+            raise ValueError("Can't pick a default. No maps to pick from")
+
+        history = [obj["name"] for obj in maps_history]
+        index = 0
+        for name in maps:
+            try:
+                idx = history.index(name)
+            except ValueError:
+                return name
+            index = max(idx, index)
+
+        return history[index]
+
+    def pick_default_next_map(self):
+        selection = self.get_selection()
+        maps_history = MapsHistory()
+        config = VoteMapUserConfig.load_from_db()
+        all_maps = [maps.parse_layer(m) for m in self.rcon.get_maps()]
+
+        if not config.allow_default_to_offensive:
+            logger.debug(
+                "Not allowing default to offensive, removing all offensive maps"
+            )
+            selection = [m for m in selection if m.game_mode != maps.GameMode.OFFENSIVE]
+            all_maps = [m for m in all_maps if m.game_mode != maps.GameMode.OFFENSIVE]
+
+        if not config.allow_default_to_skirmish:
+            logger.debug("Not allowing default to skirmish, removing all skirmish maps")
+            selection = [m for m in selection if not m.game_mode.is_small()]
+            all_maps = [m for m in all_maps if not m.game_mode.is_small()]
+
+        if not maps_history:
+            choice = random.choice([m for m in self.get_map_whitelist()])
+            return choice
+
+        return {
+            DefaultMethods.least_played_suggestions: partial(
+                self.pick_least_played_map, selection
+            ),
+            DefaultMethods.least_played_all_maps: partial(
+                self.pick_least_played_map, all_maps
+            ),
+            DefaultMethods.random_all_maps: lambda: random.choice(
+                list(set(all_maps) - set([maps.parse_layer(maps_history[0]["name"])]))
+            ),
+            DefaultMethods.random_suggestions: lambda: random.choice(
+                list(set(selection) - set([maps.parse_layer(maps_history[0]["name"])]))
+            ),
+        }[config.default_method]()
+
+    def apply_results(self):
+        config = VoteMapUserConfig.load_from_db()
+        if not config.enabled:
+            return True
+
+        votes = self.get_votes()
+        first = Counter(votes.values()).most_common(1)
+        if not first:
+            next_map = self.pick_default_next_map()
+            logger.warning(
+                "No votes recorded, defaulting with %s using default winning map %s",
+                config.default_method.value,
+                next_map,
+            )
+        else:
+            logger.info(f"{votes=}")
+            next_map = first[0][0]
+            if next_map not in self.rcon.get_maps():
+                logger.error(
+                    f"{next_map=} is not part of the all map list maps={self.rcon.get_maps()}"
+                )
+            if next_map not in (selection := self.get_selection()):
+                logger.error(f"{next_map=} is not part of vote selection {selection=}")
+            logger.info(f"Winning map {next_map=}")
+
+        rcon = get_rcon()
+        # Apply rotation safely
+
+        current_rotation = rcon.get_map_rotation()
+
+        while len(current_rotation) > 1:
+            # Make sure only 1 map is in rotation
+            map_ = current_rotation.pop(1)
+            rcon.remove_map_from_rotation(map_.id)
+
+        current_next_map = current_rotation[0]
+        if current_next_map != next_map:
+            # Replace the only map left in rotation
+            rcon.add_map_to_rotation(str(next_map))
+            rcon.remove_map_from_rotation(current_next_map.id)
+
+        # Check that it worked
+        current_rotation = rcon.get_map_rotation()
+        if len(current_rotation) != 1 or current_rotation[0] != next_map:
+            raise ValueError(
+                f"Applying the winning map {next_map=} failed: {current_rotation=}"
+            )
+
+        logger.info(
+            f"Successfully applied winning mapp {next_map=}, new rotation {current_rotation=}"
+        )
+        return True
+
+    def apply_with_retry(self, nb_retry=2):
+        success = False
+
+        for i in range(nb_retry):
+            try:
+                success = self.apply_results()
+            except:
+                logger.exception("Applying vote map result failed.")
+            else:
+                break
+
+        if not success:
+            logger.warning("Unable to set votemap results")
